@@ -9,7 +9,8 @@ import { JevPanel } from './JevPanel'
 import { EvalBar } from './EvalBar'
 
 const START = new Chess().fen()
-const ARROW_COLORS = ['#56c271', '#3f8fd4']
+/** Top two engine moves share a hue; the darker one is the better move. */
+const ARROW_COLORS = ['#1c7a43', '#7ed3a4']
 const JEV_COLOR = '#e8a33d'
 
 export function AnalyzeTab({ engine }: { engine: Engine }) {
@@ -45,7 +46,12 @@ export function AnalyzeTab({ engine }: { engine: Engine }) {
   // ---------------------------------------------------------------- analysis
 
   useEffect(() => {
-    if (gameOver) { setLines([]); setDepth(0); return }
+    // Drop the previous position's results immediately. Anything still on
+    // screen belongs to a board that is no longer in front of the user.
+    setLines([])
+    setDepth(0)
+    if (gameOver) { setThinking(false); return }
+
     const id = ++runId.current
     setThinking(true)
     setEngineError('')
@@ -96,19 +102,35 @@ export function AnalyzeTab({ engine }: { engine: Engine }) {
 
   const arrows = useMemo(() => {
     const out: { startSquare: string; endSquare: string; color: string }[] = []
+    // MultiPV lines transiently agree on a first move at shallow depth, and
+    // Jev may land on the engine's second choice. The board keys arrows by
+    // from-to, so the same squares must only be pushed once.
+    const seen = new Set<string>()
+    const push = (from: string, to: string, color: string) => {
+      const key = `${from}-${to}`
+      if (seen.has(key)) return
+      seen.add(key)
+      out.push({ startSquare: from, endSquare: to, color })
+    }
+
     lines.slice(0, 2).forEach((line, i) => {
       const uci = line.pv[0]
       if (!uci) return
-      out.push({
-        startSquare: uci.slice(0, 2),
-        endSquare: uci.slice(2, 4),
-        color: ARROW_COLORS[i],
-      })
+      // Validate against the position on screen rather than trusting the
+      // coordinates. A move that will not play here must never be drawn.
+      const probe = new Chess()
+      let move = null
+      try {
+        probe.load(fen)
+        move = probe.move(uciToObject(uci))
+      } catch { return }
+      if (!move) return
+      push(move.from, move.to, ARROW_COLORS[i])
     })
     // Only draw Jev's arrow when it disagrees -- otherwise it just hides one.
     if (jev && jev.move.choice !== engineBestSan) {
       const sq = sanToSquares(fen, jev.move.choice)
-      if (sq) out.push({ startSquare: sq.from, endSquare: sq.to, color: JEV_COLOR })
+      if (sq) push(sq.from, sq.to, JEV_COLOR)
     }
     return out
   }, [lines, jev, fen, engineBestSan])
@@ -174,6 +196,9 @@ export function AnalyzeTab({ engine }: { engine: Engine }) {
                     boardOrientation: orientation,
                     arrows,
                     allowDrawingArrows: true,
+                    // Arrows the user draws by hand belong to the position they
+                    // drew them on, so drop them when the position changes.
+                    clearArrowsOnPositionChange: true,
                     onPieceDrop: ({ sourceSquare, targetSquare }) =>
                       targetSquare ? playMove(sourceSquare, targetSquare) : false,
                     darkSquareStyle: { backgroundColor: '#5b6b8c' },
@@ -191,6 +216,11 @@ export function AnalyzeTab({ engine }: { engine: Engine }) {
                 onClick={() => setOrientation(orientation === 'white' ? 'black' : 'white')}
               >Flip</button>
               <span className="grow" />
+              {lines[0] && (
+                <span className="mono" style={{ fontWeight: 650 }}>
+                  {formatEval(lines[0], sideToMove)}
+                </span>
+              )}
               <span className="small muted">
                 {gameOver ? 'Game over' : `${sideToMove === 'w' ? 'White' : 'Black'} to move`}
               </span>
@@ -201,12 +231,12 @@ export function AnalyzeTab({ engine }: { engine: Engine }) {
             <h2>Position input</h2>
             <div className="row tight">
               <input
-                type="text" className="mono small grow" value={fenDraft}
+                type="text" className="mono small grow" data-testid="fen-input" value={fenDraft}
                 onChange={(e) => setFenDraft(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && applyFen(fenDraft)}
                 spellCheck={false}
               />
-              <button onClick={() => applyFen(fenDraft)}>Load FEN</button>
+              <button data-testid="fen-load" onClick={() => applyFen(fenDraft)}>Load FEN</button>
             </div>
             <textarea
               rows={3} placeholder="…or paste a PGN and jump to its final position"

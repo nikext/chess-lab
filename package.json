@@ -10,7 +10,8 @@
     "preview": "vite preview",
     "selftest": "node scripts/run-selftest.mjs",
     "smoke": "node scripts/run-smoke.mjs",
-    "test": "node scripts/run-selftest.mjs && node scripts/run-smoke.mjs"
+    "test": "node scripts/run-selftest.mjs && node scripts/run-enginetest.mjs && node scripts/run-smoke.mjs",
+    "enginetest": "node scripts/run-enginetest.mjs"
   },
   "dependencies": {
     "chess.js": "^1.4.0",

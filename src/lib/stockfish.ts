@@ -1,8 +1,14 @@
 /**
- * Minimal UCI driver for the single-threaded Stockfish 19 WASM build in
- * /public/engine. Single-threaded is deliberate: the multi-threaded build
- * needs SharedArrayBuffer, which means COOP/COEP headers on every response.
- * Not worth it for a local tool -- this build still plays far above human level.
+ * UCI driver for the single-threaded Stockfish 19 WASM build in /public/engine.
+ * Single-threaded is deliberate: the multi-threaded build needs SharedArrayBuffer,
+ * which means COOP/COEP headers on every response. Not worth it for a local
+ * tool -- this build still plays far above human level.
+ *
+ * The engine is a single stateful process, so every command sequence runs
+ * through one queue. Firing `position`/`go` at it while a search is still
+ * running does not queue up politely: the search keeps running on the OLD
+ * position, its results get attributed to the new one, and the module can
+ * crash outright. Hence the handshakes below -- they are load-bearing.
  */
 
 export type EngineLine = {
@@ -23,12 +29,17 @@ export type AnalysisUpdate = {
 }
 
 const ENGINE_URL = '/engine/stockfish-19-lite-single.js'
+/** Guard against a handshake that never lands, so the queue cannot wedge. */
+const HANDSHAKE_TIMEOUT_MS = 10_000
 
 export class Engine {
   private worker: Worker | null = null
   private listeners = new Set<(line: string) => void>()
   private ready: Promise<void> | null = null
+  private queue: Promise<unknown> = Promise.resolve()
   private generation = 0
+  private searching = false
+  private multipv = 0
 
   async init(): Promise<void> {
     if (this.ready) return this.ready
@@ -41,7 +52,7 @@ export class Engine {
       }
       this.worker.onmessage = (e: MessageEvent) => {
         const text = typeof e.data === 'string' ? e.data : String(e.data?.data ?? '')
-        for (const fn of this.listeners) fn(text)
+        for (const fn of [...this.listeners]) fn(text)
       }
       this.worker.onerror = (e) => reject(new Error(`engine worker failed: ${e.message}`))
 
@@ -62,15 +73,41 @@ export class Engine {
     this.worker?.postMessage(cmd)
   }
 
-  /** Abort whatever search is running. Safe to call when idle. */
+  /** Resolve on the first line matching `pred`, or on timeout. */
+  private once(pred: (line: string) => boolean): Promise<void> {
+    return new Promise<void>((resolve) => {
+      const done = () => {
+        clearTimeout(timer)
+        this.listeners.delete(fn)
+        resolve()
+      }
+      const fn = (line: string) => { if (pred(line)) done() }
+      const timer = setTimeout(done, HANDSHAKE_TIMEOUT_MS)
+      this.listeners.add(fn)
+    })
+  }
+
+  /** Block until the engine has drained everything sent so far. */
+  private async sync(): Promise<void> {
+    const readyok = this.once((l) => l.startsWith('readyok'))
+    this.send('isready')
+    await readyok
+  }
+
+  /**
+   * Abandon the current and any queued search.
+   * Safe to call when idle. The running search still drains to its `bestmove`
+   * so the engine is left idle and ready for the next command.
+   */
   stop() {
     this.generation++
-    this.send('stop')
+    if (this.searching) this.send('stop')
   }
 
   /**
    * Search `fen` and report the top `multipv` lines.
-   * Resolves with the final set of lines; `onUpdate` fires at each new depth.
+   * Resolves with the final set of lines, or an empty array if a newer call
+   * superseded this one. `onUpdate` fires at each new depth.
    */
   async analyse(
     fen: string,
@@ -80,38 +117,72 @@ export class Engine {
     await this.init()
     const { multipv = 2, depth = 20, movetimeMs } = opts
 
+    // Claim a generation now: a later call bumps it and this one becomes a
+    // no-op, even if it is still sitting in the queue.
     const gen = ++this.generation
+    if (this.searching) this.send('stop')
+
+    const task = this.queue.then(() => this.run(gen, fen, multipv, depth, movetimeMs, onUpdate))
+    // Keep the chain alive regardless of how this particular search ended.
+    this.queue = task.catch(() => undefined)
+    return task
+  }
+
+  private async run(
+    gen: number,
+    fen: string,
+    multipv: number,
+    depth: number,
+    movetimeMs: number | undefined,
+    onUpdate?: (u: AnalysisUpdate) => void,
+  ): Promise<EngineLine[]> {
+    if (gen !== this.generation) return []
+
+    if (this.multipv !== multipv) {
+      this.send(`setoption name MultiPV value ${multipv}`)
+      this.multipv = multipv
+    }
+    this.send('ucinewgame')
+    await this.sync()
+    this.send(`position fen ${fen}`)
+    // Confirm the position landed before searching it. Without this the engine
+    // can still be on the previous position when `go` arrives.
+    await this.sync()
+
+    if (gen !== this.generation) return []
+
     const lines = new Map<number, EngineLine>()
     let maxDepth = 0
 
-    return new Promise<EngineLine[]>((resolve) => {
+    const finished = new Promise<EngineLine[]>((resolve) => {
       const collect = (text: string) => {
+        if (text.startsWith('bestmove')) {
+          this.listeners.delete(collect)
+          this.searching = false
+          const final = sorted(lines)
+          if (gen === this.generation) onUpdate?.({ lines: final, depth: maxDepth, done: true })
+          resolve(gen === this.generation ? final : [])
+          return
+        }
+
+        // Still drain a superseded search to its bestmove, but report nothing.
         if (gen !== this.generation) return
 
         if (text.startsWith('info ') && text.includes(' pv ')) {
           const parsed = parseInfo(text)
-          if (parsed) {
-            lines.set(parsed.multipv, parsed)
-            maxDepth = Math.max(maxDepth, parsed.depth)
-            onUpdate?.({ lines: sorted(lines), depth: maxDepth, done: false })
-          }
-          return
-        }
-
-        if (text.startsWith('bestmove')) {
-          this.listeners.delete(collect)
-          const final = sorted(lines)
-          onUpdate?.({ lines: final, depth: maxDepth, done: true })
-          resolve(final)
+          if (!parsed) return
+          lines.set(parsed.multipv, parsed)
+          maxDepth = Math.max(maxDepth, parsed.depth)
+          onUpdate?.({ lines: sorted(lines), depth: maxDepth, done: false })
         }
       }
 
       this.listeners.add(collect)
-      this.send(`setoption name MultiPV value ${multipv}`)
-      this.send('ucinewgame')
-      this.send(`position fen ${fen}`)
+      this.searching = true
       this.send(movetimeMs ? `go movetime ${movetimeMs}` : `go depth ${depth}`)
     })
+
+    return finished
   }
 
   dispose() {
@@ -119,6 +190,8 @@ export class Engine {
     this.worker?.terminate()
     this.worker = null
     this.ready = null
+    this.searching = false
+    this.queue = Promise.resolve()
     this.listeners.clear()
   }
 }
@@ -128,6 +201,11 @@ function sorted(map: Map<number, EngineLine>): EngineLine[] {
 }
 
 function parseInfo(text: string): EngineLine | null {
+  // Aspiration-window searches emit provisional scores flagged `lowerbound` or
+  // `upperbound`. Those are search bounds, not evaluations, and rendering them
+  // makes the eval bar lurch to values the engine never actually claimed.
+  if (text.includes('lowerbound') || text.includes('upperbound')) return null
+
   const tok = text.split(/\s+/)
   const at = (k: string) => {
     const i = tok.indexOf(k)
@@ -151,6 +229,7 @@ function parseInfo(text: string): EngineLine | null {
     if (kind === 'cp') cp = value
     else if (kind === 'mate') mate = value
   }
+  if (cp === null && mate === null) return null
 
   return { multipv: Number(at('multipv') ?? 1), depth, cp, mate, pv }
 }
@@ -160,7 +239,7 @@ export function formatEval(line: EngineLine, sideToMove: 'w' | 'b'): string {
   const flip = sideToMove === 'b' ? -1 : 1
   if (line.mate !== null) {
     const m = line.mate * flip
-    return `#${m > 0 ? '' : '-'}${Math.abs(line.mate)}`
+    return `${m > 0 ? '#' : '#-'}${Math.abs(line.mate)}`
   }
   if (line.cp === null) return '--'
   const pawns = (line.cp * flip) / 100
@@ -172,5 +251,5 @@ export function winProbability(line: EngineLine, sideToMove: 'w' | 'b'): number 
   const flip = sideToMove === 'b' ? -1 : 1
   if (line.mate !== null) return line.mate * flip > 0 ? 1 : 0
   if (line.cp === null) return 0.5
-  return 1 / (1 + Math.exp((-0.00368208 * line.cp * flip)))
+  return 1 / (1 + Math.exp(-0.00368208 * line.cp * flip))
 }

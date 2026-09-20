@@ -87,9 +87,26 @@ npm test         # in another
   contrasts, then checks detection accuracy, calibration, per-square
   recognition, and that a flipped board reconstructs the same FEN. Open
   `/selftest.html` in a browser to see the rendered cases.
+- `npm run enginetest` — checks the Stockfish driver against positions with
+  known answers (mate in one, free material, a defended pawn it must not
+  grab), and then does the thing the UI does: interrupt a search and
+  immediately ask about the next position, asserting that every line reported
+  is legal in the position it was reported for. Open `/enginetest.html` to
+  watch it.
 - `npm run smoke` — drives the real app: Stockfish boots and reaches depth,
-  multipv lines and arrows appear, the Jev panel degrades gracefully with no
-  key, and the console stays clean.
+  arrows refresh when the position changes and leave nothing stale behind, the
+  eval bar tracks forced mate, the Jev panel renders a live reading (or a
+  clear message when no key is set), and the console stays clean.
+
+### A note on the engine driver
+
+Stockfish is a single stateful process. Sending `position`/`go` while a search
+is running does not queue politely — the search keeps running on the *old*
+position, its results get attributed to the new one, and the WASM module can
+crash outright. `src/lib/stockfish.ts` therefore runs every command sequence
+through one queue and waits for `readyok` after `ucinewgame` and after
+`position`. Those handshakes are load-bearing; removing them brings back stale
+arrows and nonsense evaluations.
 
 ## How Jev is asked
 
